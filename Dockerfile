@@ -14,4 +14,4 @@ EXPOSE 8000
 
 # Default: run the FastAPI server
 # Override CMD to run inference: docker run ... python inference.py
-CMD ["uvicorn", "server:app", "--host", "0.0.0.0", "--port", "8000"]
+CMD ["uvicorn", "server:app", "--host", "0.0.0.0", "--port", "7860"]
