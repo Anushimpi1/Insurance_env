@@ -1,0 +1,16 @@
+[project]
+name = "insurance-env"
+version = "1.0.0"
+description = "Insurance Claim Adjudication under Uncertainty"
+readme = "README.md"
+requires-python = ">=3.9"
+
+dependencies = [
+    "fastapi>=0.110.0",
+    "uvicorn[standard]>=0.29.0",
+    "pydantic>=2.0.0",
+    "openai>=1.0.0"
+]
+
+[project.scripts]
+server = "server:app"
