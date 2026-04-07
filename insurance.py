@@ -415,11 +415,13 @@ class InsuranceEnv:
             )
 
 def grade_easy(env: InsuranceEnv) -> float:
-    """Fraction of genuine claims correctly approved."""
+    """Fraction of genuine claims correctly approved. Clamped to open interval (0, 1)."""
     total_genuine = env.total_claims - env.total_fraud
     if total_genuine == 0:
-        return 1.0
-    return max(0.0, min(1.0, env.correct_approvals / total_genuine))
+        raw = 0.5
+    else:
+        raw = env.correct_approvals / total_genuine
+    return max(0.001, min(0.999, raw))
 
 
 def grade_medium(env: InsuranceEnv) -> float:
@@ -427,12 +429,12 @@ def grade_medium(env: InsuranceEnv) -> float:
     raw = (
         env.correct_approvals + env.fraud_caught - env.wrong_approvals * 0.5
     ) / env.total_claims
-    return max(0.0, min(1.0, raw))
+    return max(0.001, min(0.999, raw))
 
 
 def grade_hard(env: InsuranceEnv) -> float:
     """Normalised total reward. Perfect play achieves ~65 reward → score 1.0."""
-    return max(0.0, min(1.0, env.total_reward / 65.0))
+    return max(0.001, min(0.999, env.total_reward / 65.0))
 
 def agent_policy(obs: Observation) -> str:
     """
