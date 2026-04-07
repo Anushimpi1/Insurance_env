@@ -1,22 +1,25 @@
 """
 FastAPI server for Insurance Claim Adjudication under Uncertainty
 =================================================================
-Exposes the InsuranceEnv as an HTTP API so any external agent
-(Python, JavaScript, curl) can interact with it over the network.
+Entry point: main() — starts uvicorn programmatically.
+This satisfies the OpenEnv validator which requires a main() entry point
+rather than a direct reference to the app object (server:app).
 
 Endpoints
 ---------
-POST /reset          Reset environment (optionally specify task & seed)
-POST /step           Submit an action, receive next observation
-GET  /state          Current observation without stepping
-GET  /stats          Episode statistics (scores, counters)
-GET  /health         Liveness check
+POST /reset    Reset environment (optionally specify task & seed)
+POST /step     Submit an action, receive next observation
+GET  /state    Current observation without stepping
+GET  /stats    Episode statistics
+GET  /health   Liveness check
 
 Usage
 -----
-  uvicorn server:app --host 0.0.0.0 --port 8000 --reload
+  python server.py                  # starts on port 8000
+  uvicorn server:app --port 8000    # alternative (local dev)
 """
 
+import uvicorn
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 from typing import Optional
@@ -36,12 +39,11 @@ app = FastAPI(
     version="1.0.0",
 )
 
-# Module-level env instance (single session; see /reset to switch tasks/seeds)
 _env: InsuranceEnv = InsuranceEnv(task="easy", seed=42)
 
 
 # ---------------------------------------------------------------------------
-# Request/Response schemas
+# Request schemas
 # ---------------------------------------------------------------------------
 
 class ResetRequest(BaseModel):
@@ -59,10 +61,6 @@ class StepRequest(BaseModel):
 
 @app.post("/reset", summary="Reset the environment")
 def reset(req: ResetRequest = ResetRequest()):
-    """
-    Reset the environment to the beginning of a new episode.
-    Optionally specify `task` (easy | medium | hard) and `seed`.
-    """
     global _env
     if req.task not in ("easy", "medium", "hard"):
         raise HTTPException(status_code=400, detail=f"Unknown task '{req.task}'. Choose: easy, medium, hard")
@@ -80,8 +78,6 @@ def reset(req: ResetRequest = ResetRequest()):
 @app.post("/step", summary="Submit an action")
 def step(req: StepRequest):
     """
-    Submit one action and receive the next observation, reward, and episode status.
-
     Valid actions: approve | reject | quick_check | document_audit | field_investigation | request_info
     """
     action_obj = Action(action=req.action)
@@ -99,8 +95,8 @@ def step(req: StepRequest):
         score = graders[_env.task](_env)
         response["episode_score"] = round(score, 4)
         response["message"] = (
-            f"Episode complete. Score: {score:.3f}  |  "
-            f"Fraud caught: {_env.fraud_caught}/{_env.total_fraud}  |  "
+            f"Episode complete. Score: {score:.3f} | "
+            f"Fraud caught: {_env.fraud_caught}/{_env.total_fraud} | "
             f"Correct approvals: {_env.correct_approvals}"
         )
 
@@ -109,13 +105,11 @@ def step(req: StepRequest):
 
 @app.get("/state", summary="Current observation")
 def state():
-    """Return the current observation without taking any action."""
     return {"observation": _env.state().model_dump()}
 
 
 @app.get("/stats", summary="Episode statistics")
 def stats():
-    """Return running episode statistics and current task score (if episode done)."""
     graders = {"easy": grade_easy, "medium": grade_medium, "hard": grade_hard}
     score = graders[_env.task](_env)
     return {
@@ -139,12 +133,11 @@ def health():
 
 
 # ---------------------------------------------------------------------------
-# Run directly
+# Entry point — OpenEnv validator requires main() not server:app
 # ---------------------------------------------------------------------------
 
 def main():
-    import uvicorn
-    uvicorn.run("server:app", host="0.0.0.0", port=7860)
+    uvicorn.run(app, host="0.0.0.0", port=8000)
 
 
 if __name__ == "__main__":
