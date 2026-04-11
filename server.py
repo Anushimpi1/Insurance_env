@@ -1,24 +1,3 @@
-"""
-FastAPI server for Insurance Claim Adjudication under Uncertainty
-=================================================================
-Entry point: main() — starts uvicorn programmatically.
-This satisfies the OpenEnv validator which requires a main() entry point
-rather than a direct reference to the app object (server:app).
-
-Endpoints
----------
-POST /reset    Reset environment (optionally specify task & seed)
-POST /step     Submit an action, receive next observation
-GET  /state    Current observation without stepping
-GET  /stats    Episode statistics
-GET  /health   Liveness check
-
-Usage
------
-  python server.py                  # starts on port 8000
-  uvicorn server:app --port 8000    # alternative (local dev)
-"""
-
 import uvicorn
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
@@ -33,18 +12,14 @@ app = FastAPI(
     title="Insurance Claim Adjudication Environment",
     description=(
         "An OpenEnv-compliant environment for insurance fraud triage. "
-        "An AI agent acts as a claim adjuster, inferring fraud from noisy signals "
-        "and allocating limited investigation resources."
+        "An AI agent acts as a senior claim adjuster — reasoning from raw claim signals "
+        "(no pre-computed fraud score) to detect fraud, protect genuine claimants, "
+        "and allocate scarce investigation budget strategically across a 15-claim caseload."
     ),
-    version="1.0.0",
+    version="2.0.0",
 )
 
 _env: InsuranceEnv = InsuranceEnv(task="easy", seed=42)
-
-
-# ---------------------------------------------------------------------------
-# Request schemas
-# ---------------------------------------------------------------------------
 
 class ResetRequest(BaseModel):
     task: Optional[str] = "easy"
@@ -54,10 +29,6 @@ class ResetRequest(BaseModel):
 class StepRequest(BaseModel):
     action: str
 
-
-# ---------------------------------------------------------------------------
-# Endpoints
-# ---------------------------------------------------------------------------
 
 @app.post("/reset", summary="Reset the environment")
 def reset(req: ResetRequest = ResetRequest()):
@@ -129,12 +100,8 @@ def stats():
 
 @app.get("/health", summary="Health check")
 def health():
-    return {"status": "ok", "env": "insurance_env", "version": "1.0.0"}
+    return {"status": "ok", "env": "insurance_env", "version": "2.0.0"}
 
-
-# ---------------------------------------------------------------------------
-# Entry point — OpenEnv validator requires main() not server:app
-# ---------------------------------------------------------------------------
 
 def main():
     uvicorn.run(app, host="0.0.0.0", port=8000)
