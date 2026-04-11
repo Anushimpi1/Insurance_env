@@ -1,141 +1,215 @@
 name: insurance-env
-version: "1.0.0"
+version: "2.0.0"
 description: >
-  Insurance Claim Adjudication under Uncertainty — an AI agent acts as a senior
-  insurance claim adjuster, inferring fraud from realistic noisy signals and
-  strategically allocating scarce investigation resources across a caseload of 10 claims.
+  Insurance Claim Adjudication under Uncertainty — an AI agent acts as a
+  senior insurance claim adjuster, reasoning from noisy real-world signals
+  to detect fraud while protecting genuine claimants.
 
-  The true fraud label is HIDDEN. The agent must reason under partial observability
-  using a tiered investigation toolkit whose results update a running Bayesian fraud
-  posterior. Asymmetric costs (approving fraud is 2× worse than rejecting genuine)
-  and shared investigation budget across the full caseload make this a genuine
-  sequential decision-making challenge — not a simple classifier.
+  The true fraud label is NEVER revealed. The agent receives only raw claim
+  features — document quality, filing delay, prior history, repair estimate
+  alignment — and must decide: approve, reject, or spend scarce investigation
+  budget to gather more evidence. No pre-computed fraud score is provided.
+
+  This is a genuine sequential decision-making problem under partial
+  observability and resource constraints — not a classification task.
+  Asymmetric costs (approving fraud costs 2x more than wrongly rejecting)
+  and a shared investigation budget across a 15-claim caseload force the
+  agent to reason strategically about when to act vs when to investigate.
 
 entry_point: insurance:InsuranceEnv
-max_steps: 60    
+max_steps: 90
 
 tasks:
   - name: easy
     description: >
-      Clean, highly discriminative signals. Fraud rate: 25%.
-      Investigation budget: 6.0 units.
-      Fraudulent claims have clearly poor documents, high amounts, and long filing delays.
-      Objective: maximize correct approvals of genuine claims.
-    expected_score: "~0.70"
-    strategy_hint: "Trust strong genuine signals; investigate only borderline cases."
+      Clean, discriminative signals. Fraud rate: 25%. Budget: 6.0 units.
+      Fraudulent claims have clearly poor documents, high amounts, and long
+      filing delays. Genuine claims have strong documents and clean history.
+      Objective: correctly approve genuine claims without wasting budget
+      investigating obvious cases.
+    expected_score: "~0.85"
+    strategy_hint: >
+      Count fraud vs genuine signals. Act immediately on clear cases.
+      Use request_info only on genuinely ambiguous claims.
 
   - name: medium
     description: >
-      Noisy, overlapping signals. Fraud rate: 45%.
-      Investigation budget: 4.0 units.
+      Noisy, overlapping signals. Fraud rate: 45%. Budget: 4.0 units.
       Some genuine claims look suspicious; some fraud has decent documents.
-      Objective: balance fraud detection with correct approvals.
-    expected_score: "~0.60"
-    strategy_hint: "Selective investigation; use document_audit for medium-risk claims."
+      The agent must balance fraud detection with protecting genuine claimants,
+      while managing a tighter investigation budget across 15 claims.
+    expected_score: "~0.65"
+    strategy_hint: >
+      Signal counting is less reliable. Prefer request_info to resolve
+      ambiguity cheaply before committing to document_audit.
 
   - name: hard
     description: >
-      Adversarial fraud — sophisticated fraudsters deliberately mimic genuine claimants
-      (good docs, moderate amounts, quick filings). Fraud rate: 65%.
-      Investigation budget: 2.5 units (extremely scarce).
-      Objective: maximize total reward under severe resource constraints.
-    expected_score: "~0.40"
-    strategy_hint: "Every unit counts; reserve field_investigation for truly ambiguous high-value claims."
+      Adversarial fraud. Fraud rate: 65%. Budget: 2.5 units (extremely scarce).
+      Sophisticated fraudsters deliberately mimic genuine claimants — good
+      documents, moderate amounts, quick filings. Surface signals are
+      unreliable. The agent must reason under severe uncertainty with almost
+      no investigation budget across 15 claims.
+    expected_score: "~0.45"
+    strategy_hint: >
+      Budget is 0.17 units per claim on average. Investigate only the most
+      ambiguous cases. Lean toward reject on uncertainty — wrong approvals
+      cost 2x more than wrong rejections.
 
 observation:
   claim_amount_normalized:
     type: float
     range: [0, 1]
-    description: "Claim size relative to policy limit"
+    description: >
+      Claim size relative to policy limit. Values above 0.75 are suspicious.
   days_since_incident:
     type: int
     range: [0, 60]
-    description: "Filing delay in days; longer delays are suspicious"
+    description: >
+      Days between the incident and the claim filing. Delays above 30 days
+      are suspicious. Immediate filing (<=3 days) is a genuine signal.
   num_prior_claims:
     type: int
     range: [0, 8]
-    description: "Claimant's historical claim count; high values are suspicious"
+    description: >
+      Number of claims this claimant has previously filed. >=4 is suspicious.
+      0 is a genuine signal.
   document_score:
     type: float
     range: [0, 1]
-    description: "Document completeness and authenticity; low = suspicious"
+    description: >
+      Document completeness and authenticity score. Below 0.35 is suspicious.
+      Above 0.80 is a genuine signal.
   witness_available:
     type: bool
-    description: "Whether a corroborating witness has been identified"
+    description: >
+      Whether a corroborating witness has been identified. Absence is a
+      weak fraud signal; presence is a genuine signal.
   repair_estimate_match:
     type: float
     range: [0, 1]
-    description: "Alignment between repair estimate and claimed amount; low = suspicious"
-  fraud_score:
-    type: float
-    range: [0, 1]
-    description: "Running Bayesian posterior P(fraud | evidence so far). Updated by investigation actions."
+    description: >
+      Alignment between the independent repair estimate and the claimed amount.
+      Below 0.30 is suspicious. Above 0.80 is a genuine signal.
+  last_investigation_signal:
+    type: string
+    values: ["suspicious", "looks_genuine", "info_revealed", null]
+    description: >
+      Result of the most recent investigation action on this claim.
+      Null if no investigation has been done yet.
+      'suspicious' and 'looks_genuine' are noisy signals (accuracy depends
+      on the tool used). 'info_revealed' means request_info was used and
+      the exact values of num_prior_claims, days_since_incident, and
+      repair_estimate_match are now precise in the observation.
   investigation_units:
     type: float
-    description: "Remaining investigation budget. Shared across all remaining claims in the caseload."
+    description: >
+      Remaining investigation budget, shared across ALL remaining claims.
+      Spending heavily on one claim leaves less for future claims.
+  investigations_done:
+    type: int
+    range: [0, 3]
+    description: >
+      Number of investigations already performed on the current claim.
+      Maximum is 3. Further investigation attempts after the cap are penalised.
   claims_remaining:
     type: int
-    description: "Number of claims (including current) still to be processed"
+    description: >
+      Number of claims still to be processed, including the current one.
+      Use this with investigation_units to compute budget_per_claim.
 
 action:
   type: discrete
   values:
     - name: approve
       terminal: true
-      description: "Accept the claim. Reward: +5 if genuine, −10 if fraud."
+      description: >
+        Accept the claim. Reward: +5 if genuine, −10 if fraud.
+        Use when genuine signals clearly outweigh fraud signals.
+
     - name: reject
       terminal: true
-      description: "Deny the claim. Reward: +4 if fraud, −6 if genuine."
-    - name: quick_check
-      terminal: false
-      cost: 0.5
-      accuracy: 0.70
-      description: "Fast administrative check. Returns noisy fraud signal (70% accurate)."
-    - name: document_audit
-      terminal: false
-      cost: 1.0
-      accuracy: 0.85
-      description: "Audit submitted documents. Returns fraud signal (85% accurate)."
-    - name: field_investigation
-      terminal: false
-      cost: 2.0
-      accuracy: 0.95
-      description: "On-site visit. Highest accuracy (95%). Use for high-stakes ambiguous claims."
+      description: >
+        Deny the claim. Reward: +4 if fraud, −6 if genuine.
+        Use when fraud signals clearly outweigh genuine signals,
+        or when budget is exhausted and the claim is ambiguous.
+
     - name: request_info
       terminal: false
       cost: 0.5
       accuracy: 1.0
-      description: "Request exact claimant details. Reveals prior_claims, days_since_incident, repair_match."
+      description: >
+        Request exact claimant details. Reveals the precise values of
+        num_prior_claims, days_since_incident, and repair_estimate_match —
+        replacing the noisy initial observations with exact figures.
+        Best first investigation: cheapest and most informative.
+
+    - name: quick_check
+      terminal: false
+      cost: 0.5
+      accuracy: 0.70
+      description: >
+        Fast administrative check. Returns a noisy binary signal
+        (70% accurate). Use when budget_per_claim is very low.
+
+    - name: document_audit
+      terminal: false
+      cost: 1.0
+      accuracy: 0.85
+      description: >
+        Full audit of submitted documents. Returns a noisy binary signal
+        (85% accurate). Best follow-up after request_info leaves ambiguity.
+
+    - name: field_investigation
+      terminal: false
+      cost: 2.0
+      accuracy: 0.95
+      description: >
+        On-site visit. Highest accuracy (95%) but highest cost.
+        Only justified for high-value claims (amount > 0.75) where
+        document_audit result was inconclusive. Rarely worth it.
 
 reward:
   description: >
-    Dense per-step reward shaping the full episode trajectory.
+    Per-step rewards shape the full episode trajectory. The asymmetry
+    between approve_fraud (−10) and reject_genuine (−6) encodes the
+    real-world reality that financial fraud loss is costlier than the
+    risk of customer harm from a wrongful rejection.
   table:
-    approve_genuine:         +5.0
-    approve_fraud:          -10.0
-    reject_fraud:            +4.0
-    reject_genuine:          -6.0
-    quick_check_cost:        -0.5
-    document_audit_cost:     -1.0
+    approve_genuine:          +5.0
+    approve_fraud:           -10.0
+    reject_fraud:             +4.0
+    reject_genuine:           -6.0
+    quick_check_cost:         -0.5
+    document_audit_cost:      -1.0
     field_investigation_cost: -2.0
-    request_info_cost:       -0.5
-    high_value_claim_delay:  -0.5   
-    budget_exceeded_penalty: -1.0   
+    request_info_cost:        -0.5
+    budget_exceeded_penalty:  -1.0
+    investigation_cap_penalty: -1.0
 
 grading:
-  easy:   "correct_approvals / total_genuine_claims"
-  medium: "(correct_approvals + fraud_caught - 0.5 * wrong_approvals) / total_claims"
-  hard:   "max(0, min(1, total_reward / 65))"
+  easy: >
+    correct_approvals / total_genuine_claims
+    Measures how well the agent protects legitimate customers.
+  medium: >
+    (correct_approvals + fraud_caught - 0.5 * wrong_approvals) / total_claims
+    Balanced metric rewarding both fraud detection and genuine approvals.
+  hard: >
+    max(0, min(1, total_reward / 60))
+    Normalised total reward. Near-perfect play on 15 hard claims
+    yields approximately 60 reward, giving a score near 1.0.
 
 reproducibility:
   seed: 42
-  note: "Fixed random seed guarantees identical claim sequences across runs."
+  note: >
+    Fixed random seed guarantees identical claim sequences across runs,
+    enabling fair comparison between agents and reproducible evaluation.
 
 compliance:
-  openenv_interface: true       
-  typed_models: true           
-  task_graders: true           
+  openenv_interface: true
+  typed_models: true
+  task_graders: true
   dense_rewards: true
   yaml_metadata: true
-  baseline_agent: true                 
-  docker_support: true          
+  baseline_agent: true
+  docker_support: true
