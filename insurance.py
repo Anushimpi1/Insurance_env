@@ -3,26 +3,57 @@ from typing import Optional
 from pydantic import BaseModel, Field
 
 class Observation(BaseModel):
-    claim_amount_normalized: float = Field(..., description="Claim size / policy limit (0–1)")
-    days_since_incident: int        = Field(..., description="Filing delay in days; longer = more suspicious")
-    num_prior_claims: int           = Field(..., description="Claimant's historical claim count")
-    document_score: float           = Field(..., description="Document completeness & authenticity (0–1)")
-    witness_available: bool         = Field(..., description="Corroborating witness present")
-    repair_estimate_match: float    = Field(..., description="Repair estimate vs claim alignment (0–1)")
-    fraud_score: float              = Field(..., description="Running Bayesian fraud posterior (0–1); updated by investigations")
-    investigation_units: float      = Field(..., description="Remaining investigation budget")
-    claims_remaining: int           = Field(..., description="Claims left in caseload")
+    
+    claim_amount_normalized: float = Field(
+        ..., description="Claim size / policy limit (0-1). Higher = larger financial exposure."
+    )
+    days_since_incident: int = Field(
+        ..., description="Days between incident and filing. >30 days is suspicious."
+    )
+    num_prior_claims: int = Field(
+        ..., description="Claimant's historical claim count. >=4 is suspicious."
+    )
+    document_score: float = Field(
+        ..., description="Document completeness and authenticity (0-1). <0.4 is suspicious."
+    )
+    witness_available: bool = Field(
+        ..., description="Whether a corroborating witness has been identified."
+    )
+    repair_estimate_match: float = Field(
+        ..., description="Repair estimate vs claimed amount alignment (0-1). <0.4 is suspicious."
+    )
+    last_investigation_signal: Optional[str] = Field(
+        None,
+        description=(
+            "Result of the most recent investigation on this claim, or null if none yet. "
+            "Values: 'suspicious' | 'looks_genuine' | 'info_revealed'. "
+            "Use this to update your belief about fraud likelihood."
+        )
+    )
+    investigation_units: float = Field(
+        ..., description="Remaining investigation budget shared across all remaining claims."
+    )
+    investigations_done: int = Field(
+        ..., description="Number of investigations already done on this claim (max 3)."
+    )
+    claims_remaining: int = Field(
+        ..., description="Claims still to process including the current one."
+    )
 
 
 class Action(BaseModel):
     action: str = Field(
         ...,
-        description="One of: approve | reject | quick_check | document_audit | field_investigation | request_info",
+        description=(
+            "One of: approve | reject | "
+            "quick_check | document_audit | field_investigation | request_info"
+        ),
     )
 
 
 class Reward(BaseModel):
     value: float
+
 
 class _Claim:
     __slots__ = (
@@ -49,54 +80,55 @@ class _Claim:
         self.witness_available = witness_available
         self.repair_estimate_match = repair_estimate_match
 
+
 VALID_ACTIONS = frozenset({
     "approve", "reject",
     "quick_check", "document_audit", "field_investigation", "request_info",
 })
 
 INVESTIGATION_COSTS: dict[str, float] = {
-    "quick_check": 0.5,
-    "document_audit": 1.0,
+    "quick_check":         0.5,
+    "document_audit":      1.0,
     "field_investigation": 2.0,
-    "request_info": 0.5,
+    "request_info":        0.5,
 }
 
 INVESTIGATION_ACCURACY: dict[str, float] = {
-    "quick_check": 0.70,
-    "document_audit": 0.85,
+    "quick_check":         0.70,
+    "document_audit":      0.85,
     "field_investigation": 0.95,
 }
 
 TASK_BUDGETS: dict[str, float] = {
-    "easy": 6.0,
+    "easy":   6.0,
     "medium": 4.0,
-    "hard": 2.5,
+    "hard":   2.5,
 }
 
 TASK_FRAUD_RATES: dict[str, float] = {
-    "easy": 0.25,
+    "easy":   0.25,
     "medium": 0.45,
-    "hard": 0.65,
+    "hard":   0.65,
 }
 
-TOTAL_CLAIMS = 10
-MAX_STEPS_PER_CLAIM = 4   
+TOTAL_CLAIMS = 15
+MAX_STEPS_PER_CLAIM = 4
 
-
-REWARD_APPROVE_GENUINE   =  5.0
-REWARD_APPROVE_FRAUD     = -10.0
-REWARD_REJECT_FRAUD      =  4.0
-REWARD_REJECT_GENUINE    = -6.0
-PENALTY_HIGH_VALUE_DELAY = -0.5   
-PENALTY_BUDGET_EXCEEDED  = -1.0  
-
+REWARD_APPROVE_GENUINE  =  5.0
+REWARD_APPROVE_FRAUD    = -10.0
+REWARD_REJECT_FRAUD     =  4.0
+REWARD_REJECT_GENUINE   = -6.0
+PENALTY_BUDGET_EXCEEDED = -1.0
+HARD_REWARD_NORMALIZER = 60.0
 
 
 class InsuranceEnv:
-
+    
     def __init__(self, task: str = "easy", seed: int = 42):
         if task not in TASK_BUDGETS:
-            raise ValueError(f"Unknown task '{task}'. Choose from: {list(TASK_BUDGETS)}")
+            raise ValueError(
+                f"Unknown task '{task}'. Choose from: {list(TASK_BUDGETS)}"
+            )
         self.task = task
         self.seed = seed
         self.total_claims = TOTAL_CLAIMS
@@ -108,11 +140,13 @@ class InsuranceEnv:
         self._steps_on_current_claim: int = 0
         self._fraud_posterior: float = TASK_FRAUD_RATES[task]  
 
+        self._last_signal: Optional[str] = None
+
         self.correct_approvals: int = 0
         self.wrong_approvals: int = 0
         self.fraud_caught: int = 0
         self.genuine_rejected: int = 0
-        self.total_fraud: int = 0      
+        self.total_fraud: int = 0
         self.total_reward: float = 0.0
 
     def reset(self) -> Observation:
@@ -121,6 +155,7 @@ class InsuranceEnv:
         self._rng = random.Random(self.seed)
         self._steps_on_current_claim = 0
         self._fraud_posterior = TASK_FRAUD_RATES[self.task]
+        self._last_signal = None
 
         self.correct_approvals = 0
         self.wrong_approvals = 0
@@ -132,7 +167,7 @@ class InsuranceEnv:
         self._current_claim = self._generate_claim()
         return self._make_observation()
 
-    def step(self, action: Action):  
+    def step(self, action: Action):
         
         action_str = action.action.strip().lower()
 
@@ -141,59 +176,80 @@ class InsuranceEnv:
                 self._make_observation(),
                 Reward(value=-3.0),
                 False,
-                {"explanation": f"Invalid action '{action_str}'. Valid: {sorted(VALID_ACTIONS)}",
-                 "is_fraud": None},
+                {
+                    "explanation": (
+                        f"Invalid action '{action_str}'. "
+                        f"Valid: {sorted(VALID_ACTIONS)}"
+                    ),
+                    "investigation_signal": None,
+                    "is_fraud": None,
+                    "steps_on_claim": self._steps_on_current_claim,
+                    "investigation_units_remaining": self.investigation_units,
+                },
             )
 
         claim = self._current_claim
         reward = 0.0
         explanation = ""
+        investigation_signal = None
         advance_claim = False
 
+        
         if action_str == "approve":
             advance_claim = True
             if not claim.is_fraud:
-                reward += REWARD_APPROVE_GENUINE
+                reward = REWARD_APPROVE_GENUINE
                 self.correct_approvals += 1
-                explanation = "✓ Correctly approved genuine claim"
+                explanation = "Correctly approved genuine claim (+5)"
             else:
-                reward += REWARD_APPROVE_FRAUD
+                reward = REWARD_APPROVE_FRAUD
                 self.wrong_approvals += 1
-                explanation = "✗ Approved fraudulent claim — significant financial loss"
+                explanation = "Approved fraudulent claim — significant financial loss (-10)"
 
         elif action_str == "reject":
             advance_claim = True
             if claim.is_fraud:
-                reward += REWARD_REJECT_FRAUD
+                reward = REWARD_REJECT_FRAUD
                 self.fraud_caught += 1
-                explanation = "✓ Correctly rejected fraudulent claim"
+                explanation = "Correctly rejected fraudulent claim (+4)"
             else:
-                reward += REWARD_REJECT_GENUINE
+                reward = REWARD_REJECT_GENUINE
                 self.genuine_rejected += 1
-                explanation = "✗ Wrongly rejected genuine claim — customer harm & legal risk"
+                explanation = "Wrongly rejected genuine claim — customer harm (-6)"
 
+        
         elif action_str in INVESTIGATION_COSTS:
-            
+
             if self._steps_on_current_claim >= MAX_STEPS_PER_CLAIM:
-                reward -= 1.0
+                reward = -1.0
                 explanation = (
-                    f"Investigation cap reached ({MAX_STEPS_PER_CLAIM} steps per claim). "
-                    "You must approve or reject."
+                    f"Investigation cap reached ({MAX_STEPS_PER_CLAIM} per claim). "
+                    "You must approve or reject now."
                 )
+
             else:
                 cost = INVESTIGATION_COSTS[action_str]
+
                 if self.investigation_units >= cost:
-                    self.investigation_units = round(self.investigation_units - cost, 2)
-                    reward -= cost
+                    self.investigation_units = round(
+                        self.investigation_units - cost, 2
+                    )
+                    reward = -cost
 
                     if action_str == "request_info":
+                        investigation_signal = "info_revealed"
+                        self._last_signal = "info_revealed"
+                        self._fraud_posterior = self._update_posterior_from_info(
+                            claim
+                        )
                         explanation = (
-                            f"[INFO] prior_claims={claim.num_prior_claims}, "
+                            f"[REQUEST INFO] Exact details revealed: "
+                            f"prior_claims={claim.num_prior_claims}, "
                             f"days_since_incident={claim.days_since_incident}, "
                             f"repair_match={claim.repair_estimate_match:.2f} | "
-                            f"Units left: {self.investigation_units}"
+                            f"Budget remaining: {self.investigation_units}"
                         )
-                        self._fraud_posterior = self._update_posterior_from_info(claim)
+
                     else:
                         accuracy = INVESTIGATION_ACCURACY[action_str]
                         signal_is_fraud = (
@@ -204,37 +260,40 @@ class InsuranceEnv:
                         self._fraud_posterior = self._bayesian_update(
                             self._fraud_posterior, accuracy, signal_is_fraud
                         )
-                        label = "suspicious" if signal_is_fraud else "looks genuine"
-                        tool_labels = {
-                            "quick_check": f"Quick check ({int(accuracy*100)}% reliable)",
-                            "document_audit": f"Document audit ({int(accuracy*100)}% reliable)",
-                            "field_investigation": f"Field investigation ({int(accuracy*100)}% reliable)",
+                        signal_label = (
+                            "suspicious" if signal_is_fraud else "looks_genuine"
+                        )
+                        investigation_signal = signal_label
+                        self._last_signal = signal_label
+
+                        tool_names = {
+                            "quick_check":         f"Quick Check ({int(accuracy*100)}% reliable)",
+                            "document_audit":      f"Document Audit ({int(accuracy*100)}% reliable)",
+                            "field_investigation": f"Field Investigation ({int(accuracy*100)}% reliable)",
                         }
                         explanation = (
-                            f"[{tool_labels[action_str]}] Signal: {label} | "
-                            f"Fraud posterior: {self._fraud_posterior:.2f} | "
-                            f"Units left: {self.investigation_units}"
+                            f"[{tool_names[action_str]}] Signal: {signal_label} | "
+                            f"Budget remaining: {self.investigation_units}"
                         )
+
                 else:
-                    reward += PENALTY_BUDGET_EXCEEDED
+                    reward = PENALTY_BUDGET_EXCEEDED
                     explanation = (
                         f"Insufficient budget for {action_str} "
-                        f"(costs {cost}, have {self.investigation_units:.1f})"
+                        f"(costs {cost:.1f}, have {self.investigation_units:.1f}). "
+                        "Penalty applied."
                     )
-
-        if not advance_claim and claim.claim_amount_normalized >= 0.75:
-            reward += PENALTY_HIGH_VALUE_DELAY
-            explanation += " | ⚠ High-value claim delay penalty"
 
         self.total_reward += reward
         self._steps_on_current_claim += 1
 
         if advance_claim:
             if claim.is_fraud:
-                self.total_fraud += 1         
+                self.total_fraud += 1
             self.current_claim_idx += 1
             self._steps_on_current_claim = 0
             self._fraud_posterior = TASK_FRAUD_RATES[self.task]
+            self._last_signal = None
             if self.current_claim_idx < self.total_claims:
                 self._current_claim = self._generate_claim()
 
@@ -246,8 +305,8 @@ class InsuranceEnv:
             done,
             {
                 "explanation": explanation,
+                "investigation_signal": investigation_signal,
                 "is_fraud": claim.is_fraud if advance_claim else None,
-                "fraud_posterior": round(self._fraud_posterior, 3),
                 "steps_on_claim": self._steps_on_current_claim,
                 "investigation_units_remaining": self.investigation_units,
             },
@@ -265,24 +324,22 @@ class InsuranceEnv:
             document_score=round(c.document_score, 3),
             witness_available=c.witness_available,
             repair_estimate_match=round(c.repair_estimate_match, 3),
-            fraud_score=round(self._fraud_posterior, 3),
+            last_investigation_signal=self._last_signal,
             investigation_units=self.investigation_units,
+            investigations_done=self._steps_on_current_claim,
             claims_remaining=self.total_claims - self.current_claim_idx,
         )
 
     @staticmethod
-    def _bayesian_update(prior: float, accuracy: float, signal_is_fraud: bool) -> float:
-        """
-        Update fraud posterior with a noisy binary signal using Bayes' theorem.
-
-        P(fraud | signal=fraud) = P(signal=fraud | fraud) * P(fraud)
-                                  / P(signal=fraud)
-        """
+    def _bayesian_update(
+        prior: float, accuracy: float, signal_is_fraud: bool
+    ) -> float:
+        """Bayes' theorem update from a noisy binary investigation signal."""
         if signal_is_fraud:
-            numerator = accuracy * prior
+            numerator   = accuracy * prior
             denominator = accuracy * prior + (1 - accuracy) * (1 - prior)
         else:
-            numerator = (1 - accuracy) * prior
+            numerator   = (1 - accuracy) * prior
             denominator = (1 - accuracy) * prior + accuracy * (1 - prior)
 
         if denominator == 0:
@@ -290,47 +347,38 @@ class InsuranceEnv:
         return max(0.0, min(1.0, numerator / denominator))
 
     def _update_posterior_from_info(self, claim: _Claim) -> float:
-        
-        p = self._fraud_posterior  # start from current posterior, not scratch
+        """
+        Bayesian posterior update from exact revealed feature values.
 
-        if claim.num_prior_claims >= 5:
-            lr = 3.0   
-        elif claim.num_prior_claims >= 3:
-            lr = 1.8   
-        elif claim.num_prior_claims == 0:
-            lr = 0.5  
-        else:
-            lr = 1.0   # neutral
+        Applies three sequential likelihood-ratio updates starting from the
+        CURRENT posterior — preserving all prior investigation evidence.
+        Does NOT reset to a flat prior, which was the original design flaw.
+        """
+        p = self._fraud_posterior
+
+        if   claim.num_prior_claims >= 5: lr = 3.0
+        elif claim.num_prior_claims >= 3: lr = 1.8
+        elif claim.num_prior_claims == 0: lr = 0.5
+        else:                             lr = 1.0
         p = (lr * p) / (lr * p + (1 - p))
         p = max(0.01, min(0.99, p))
 
-        if claim.days_since_incident > 40:
-            lr = 2.5
-        elif claim.days_since_incident > 20:
-            lr = 1.6
-        elif claim.days_since_incident <= 3:
-            lr = 0.6   
-        else:
-            lr = 1.0
+        if   claim.days_since_incident > 40: lr = 2.5
+        elif claim.days_since_incident > 20: lr = 1.6
+        elif claim.days_since_incident <= 3: lr = 0.6
+        else:                                lr = 1.0
         p = (lr * p) / (lr * p + (1 - p))
         p = max(0.01, min(0.99, p))
 
-
-        if claim.repair_estimate_match < 0.3:
-            lr = 2.8
-        elif claim.repair_estimate_match < 0.5:
-            lr = 1.5
-        elif claim.repair_estimate_match > 0.85:
-            lr = 0.5   
-        else:
-            lr = 1.0
+        if   claim.repair_estimate_match < 0.3:  lr = 2.8
+        elif claim.repair_estimate_match < 0.5:  lr = 1.5
+        elif claim.repair_estimate_match > 0.85: lr = 0.5
+        else:                                    lr = 1.0
         p = (lr * p) / (lr * p + (1 - p))
-        p = max(0.05, min(0.95, p))
-
-        return p
+        return max(0.05, min(0.95, p))
 
     def _generate_claim(self) -> _Claim:
-        rng = self._rng
+        rng  = self._rng
         task = self.task
 
         if task == "easy":
@@ -378,10 +426,9 @@ class InsuranceEnv:
                 repair_estimate_match=max(0.0, rng.uniform(0.6, 1.0) + noise),
             )
 
-        else:  
+        else:
             is_fraud = rng.random() < TASK_FRAUD_RATES["hard"]
             if is_fraud:
-              
                 return _Claim(
                     is_fraud=True,
                     claim_amount_normalized=rng.uniform(0.3, 0.75),
@@ -401,18 +448,16 @@ class InsuranceEnv:
                 repair_estimate_match=rng.uniform(0.5, 1.0),
             )
 
+
 def grade_easy(env: InsuranceEnv) -> float:
-    """Fraction of genuine claims correctly approved. Clamped to open interval (0, 1)."""
+    """Fraction of genuine claims correctly approved."""
     total_genuine = env.total_claims - env.total_fraud
-    if total_genuine == 0:
-        raw = 0.5
-    else:
-        raw = env.correct_approvals / total_genuine
+    raw = env.correct_approvals / total_genuine if total_genuine > 0 else 0.5
     return max(0.001, min(0.999, raw))
 
 
 def grade_medium(env: InsuranceEnv) -> float:
-    """Balanced accuracy: rewards correct decisions, penalises costly mistakes."""
+    """Balanced accuracy penalising costly mistakes."""
     raw = (
         env.correct_approvals + env.fraud_caught - env.wrong_approvals * 0.5
     ) / env.total_claims
@@ -420,52 +465,71 @@ def grade_medium(env: InsuranceEnv) -> float:
 
 
 def grade_hard(env: InsuranceEnv) -> float:
-    """Normalised total reward. Perfect play achieves ~65 reward → score 1.0."""
-    return max(0.001, min(0.999, env.total_reward / 65.0))
-
+    """
+    Normalised total reward.
+    Near-perfect play on 15 hard claims yields ~60 reward -> score ~1.0.
+    """
+    return max(0.001, min(0.999, env.total_reward / HARD_REWARD_NORMALIZER))
 
 def agent_policy(obs: Observation) -> str:
-   
-    units = obs.investigation_units
+    
+    units     = obs.investigation_units
     remaining = max(obs.claims_remaining, 1)
     budget_per_claim = units / remaining
-    fs = obs.fraud_score
 
-    if fs >= 0.80:
+    
+    fraud_signals = sum([
+        obs.claim_amount_normalized > 0.75,
+        obs.days_since_incident > 30,
+        obs.num_prior_claims >= 4,
+        obs.document_score < 0.35,
+        not obs.witness_available,
+        obs.repair_estimate_match < 0.3,
+    ])
+    genuine_signals = sum([
+        obs.document_score > 0.80,
+        obs.witness_available,
+        obs.repair_estimate_match > 0.80,
+        obs.days_since_incident <= 3,
+        obs.num_prior_claims == 0,
+    ])
+
+    if obs.last_investigation_signal == "suspicious":
+        fraud_signals += 2
+    elif obs.last_investigation_signal == "looks_genuine":
+        genuine_signals += 2
+    elif obs.last_investigation_signal == "info_revealed":
+        if fraud_signals > genuine_signals:
+            fraud_signals += 1
+        else:
+            genuine_signals += 1
+
+    total      = fraud_signals + genuine_signals
+    fraud_ratio = fraud_signals / total if total > 0 else 0.5
+
+    
+    if fraud_signals >= 4:
         return "reject"
-    if fs <= 0.20:
+    if genuine_signals >= 4 and fraud_signals <= 1:
         return "approve"
 
     
     if units < 0.5:
-       
-        return "reject" if fs >= 0.45 else "approve"
+        return "reject" if fraud_ratio >= 0.45 else "approve"
 
-   
-    if fs >= 0.70:
-      
-        if units >= 1.0 and budget_per_claim >= 0.8:
-            return "document_audit"
-        return "reject"
-
-    if fs <= 0.30:
-        if units >= 0.5 and budget_per_claim >= 0.5:
-            return "quick_check"
-        return "approve"
-
-    
-    if units >= 0.5 and budget_per_claim >= 0.5:
+    if obs.investigations_done == 0 and budget_per_claim >= 0.5:
         return "request_info"
 
-    
-    if units >= 1.0 and budget_per_claim >= 1.0:
+    if obs.investigations_done >= 1 and units >= 1.0 and budget_per_claim >= 0.8:
         return "document_audit"
 
-    
-    return "reject" if fs >= 0.50 else "approve"
+    if obs.claims_remaining <= 2:
+        return "reject" if fraud_ratio >= 0.45 else "approve"
 
+    return "reject" if fraud_ratio >= 0.45 else "approve"
 
 if __name__ == "__main__":
+    graders = {"easy": grade_easy, "medium": grade_medium, "hard": grade_hard}
 
     for task_name in ["easy", "medium", "hard"]:
         env = InsuranceEnv(task=task_name)
@@ -473,17 +537,17 @@ if __name__ == "__main__":
         done = False
         steps = 0
 
-        while not done and steps < 60:
+        while not done and steps < 90:
             act = agent_policy(obs)
             obs, reward, done, info = env.step(Action(action=act))
             steps += 1
 
-        graders = {"easy": grade_easy, "medium": grade_medium, "hard": grade_hard}
         score = graders[task_name](env)
-
         print(
-            f"[{task_name.upper():6s}] score={score:.3f}  reward={env.total_reward:+.1f}  "
-            f"steps={steps}  fraud_caught={env.fraud_caught}/{env.total_fraud}  "
+            f"[{task_name.upper():6s}] score={score:.3f}  "
+            f"reward={env.total_reward:+.1f}  steps={steps}  "
+            f"fraud_caught={env.fraud_caught}/{env.total_fraud}  "
             f"correct_approvals={env.correct_approvals}  "
-            f"wrong_approvals={env.wrong_approvals}  genuine_rejected={env.genuine_rejected}"
+            f"wrong_approvals={env.wrong_approvals}  "
+            f"genuine_rejected={env.genuine_rejected}"
         )
