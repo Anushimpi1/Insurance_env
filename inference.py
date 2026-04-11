@@ -1,30 +1,3 @@
-"""
-Inference & Evaluation Script — Insurance Claim Adjudication under Uncertainty
-===============================================================================
-Runs both the LLM agent and the rule-based baseline on every task, then prints
-a side-by-side comparison table.
-
-Key improvements over v1
-------------------------
-* Pre-decision guardrails: code short-circuits the LLM when fraud_score is
-  already clear (< 0.22 → approve, > 0.78 → reject). Stops budget waste.
-* Budget guardrail: when investigation_units < 0.5, forces a terminal action.
-* Step cap guardrail: after 3 investigations on one claim, forces a decision.
-* Improved prompt with explicit decision table + few-shot examples.
-* Fallback is agent_policy() not a hard-coded string.
-
-Required environment variables
--------------------------------
-  API_BASE_URL   LLM endpoint      (default: Groq)
-  MODEL_NAME     Model identifier  (default: llama-3.3-70b-versatile)
-  API_KEY        API key           (also checked as HF_TOKEN)
-
-Usage
------
-  python inference.py                    # all tasks, both agents
-  TASK=hard python inference.py          # single task only
-  AGENT=baseline python inference.py     # baseline only (no API key needed)
-"""
 
 import os
 import sys
@@ -38,29 +11,26 @@ from insurance import (
     grade_easy, grade_medium, grade_hard,
 )
 
-# ---------------------------------------------------------------------------
-# Configuration
-# ---------------------------------------------------------------------------
-
 API_BASE_URL = os.getenv("API_BASE_URL", "https://api.groq.com/openai/v1")
 MODEL_NAME   = os.getenv("MODEL_NAME",   "llama-3.3-70b-versatile")
-API_KEY = os.getenv("HF_TOKEN")
+API_KEY = os.getenv("HF_TOKEN") or os.getenv("API_KEY")
 
 TASKS     = ["easy", "medium", "hard"]
 BENCHMARK = "insurance_env"
 MAX_STEPS = 60
 
 GRADERS = {"easy": grade_easy, "medium": grade_medium, "hard": grade_hard}
-
-# Guardrail thresholds
-FRAUD_HIGH           = 0.78   # above → reject immediately, no investigation
-FRAUD_LOW            = 0.22   # below → approve immediately, no investigation
-MAX_INVEST_PER_CLAIM = 3      # force terminal action after this many investigations
-
-
-# ---------------------------------------------------------------------------
-# OpenEnv-compliant logging
-# ---------------------------------------------------------------------------
+FRAUD_HIGH_THRESHOLD = {
+    "easy":   0.78,   
+    "medium": 0.75,  
+    "hard":   0.70,   
+}
+FRAUD_LOW_THRESHOLD = {
+    "easy":   0.20,   
+    "medium": 0.25,  
+    "hard":   0.30,   
+}
+MAX_INVEST_PER_CLAIM = 3      
 
 def log_start(task: str, agent: str) -> None:
     print(f"[START] task={task} env={BENCHMARK} agent={agent} model={MODEL_NAME}", flush=True)
@@ -82,89 +52,113 @@ def log_end(success: bool, steps: int, score: float, rewards: List[float]) -> No
         flush=True,
     )
 
-
-# ---------------------------------------------------------------------------
-# Guardrail layer
-# ---------------------------------------------------------------------------
-
-def apply_guardrails(obs: Observation, invest_count: int) -> Optional[str]:
+def apply_guardrails(obs: Observation, invest_count: int, task: str) -> Optional[str]:
     """
     Hard rules applied BEFORE the LLM sees the state.
     Returns a forced action, or None if the LLM should decide.
 
-    Prevents the three main LLM failure modes observed in testing:
-    1. Investigating obvious cases (fraud_score already clear)
-    2. Requesting more info when budget is exhausted
-    3. Looping on the same claim past the investigation cap
+    Task-adaptive thresholds prevent over-rejection on easy tasks
+    and under-rejection on hard tasks (high fraud prior).
     """
-    # Rule 1: fraud_score is decisive — act immediately
-    if obs.fraud_score >= FRAUD_HIGH:
+    high = FRAUD_HIGH_THRESHOLD[task]
+    low  = FRAUD_LOW_THRESHOLD[task]
+
+    if obs.fraud_score >= high:
         return "reject"
-    if obs.fraud_score <= FRAUD_LOW:
+    if obs.fraud_score <= low:
         return "approve"
 
-    # Rule 2: no budget — cannot investigate, must decide
     if obs.investigation_units < 0.5:
         return agent_policy(obs)
 
-    # Rule 3: hit investigation cap on this claim — must commit
     if invest_count >= MAX_INVEST_PER_CLAIM:
         return "reject" if obs.fraud_score >= 0.5 else "approve"
 
-    return None  # LLM decides
+    if obs.claims_remaining <= 2 and obs.investigation_units < 1.5:
+        return "reject" if obs.fraud_score >= 0.5 else "approve"
 
-
-# ---------------------------------------------------------------------------
-# LLM agent
-# ---------------------------------------------------------------------------
+    return None 
 
 SYSTEM_PROMPT = """\
-You are a senior insurance claim adjuster. You process 10 claims per session.
-Your goal is to maximise total reward across the entire caseload.
+You are a senior insurance claim adjuster processing 10 claims per session.
+Your goal: maximise total reward across the entire caseload.
+
+════════════════════════════════════════════════
+ASYMMETRIC COSTS — memorise these
+════════════════════════════════════════════════
+approve genuine   = +5    approve fraud    = −10   ← WORST outcome
+reject  fraud     = +4    reject  genuine  = −6
+Investigation costs deducted from reward.
+
+Key implication: a wrong approval (fraud slips through) costs 2× more
+than a wrong rejection. When in doubt and budget is low → reject.
 
 ════════════════════════════════════════════════
 SIGNALS
 ════════════════════════════════════════════════
-fraud_score             KEY signal. Bayesian P(fraud|evidence). Starts at task prior,
-                        updated after each investigation. Range 0–1.
+fraud_score             PRIMARY signal. Bayesian P(fraud|evidence).
+                        Starts at task prior; updated after each investigation.
 claim_amount_normalized Claim / policy limit. High = larger financial exposure.
 days_since_incident     Filing delay. >30 days is suspicious.
 num_prior_claims        Historical claims. >=4 is suspicious.
 document_score          Document authenticity (0=fake, 1=authentic).
 witness_available       Corroborating witness present.
-repair_estimate_match   Estimate vs claim alignment (0=mismatch, 1=exact).
-investigation_units     SHARED budget across all remaining claims. Guard it.
-claims_remaining        Claims left including current.
+repair_estimate_match   Estimate vs claim alignment (low = suspicious).
+investigation_units     SHARED budget for all remaining claims. Guard carefully.
+claims_remaining        Claims still to process including current.
 
 ════════════════════════════════════════════════
-ACTIONS
+ACTIONS & COSTS
 ════════════════════════════════════════════════
-approve             +5 genuine / -10 fraud          [closes claim]
-reject              +4 fraud   /  -6 genuine         [closes claim]
+approve             +5 genuine / −10 fraud          [closes claim]
+reject              +4 fraud   / −6  genuine         [closes claim]
+request_info        0.5 units, 100% accurate         [reveals prior_claims, days, repair_match]
 quick_check         0.5 units, 70% accurate          [updates fraud_score]
 document_audit      1.0 unit,  85% accurate          [updates fraud_score]
-field_investigation 2.0 units, 95% accurate          [updates fraud_score]
-request_info        0.5 units, reveals exact details [updates fraud_score]
+field_investigation 2.0 units, 95% accurate          [highest accuracy, high cost]
 
 ════════════════════════════════════════════════
-DECISION TABLE — APPLY IN ORDER
+DECISION TABLE — APPLY IN STRICT ORDER
 ════════════════════════════════════════════════
-1. fraud_score > 0.78        → reject    (clear fraud, do NOT investigate)
-2. fraud_score < 0.22        → approve   (clear genuine, do NOT investigate)
-3. fraud_score 0.50–0.78
-     budget >= 1.0            → document_audit
-     budget < 1.0             → reject
-4. fraud_score 0.22–0.50
-     budget >= 1.0            → document_audit
-     budget < 0.5             → approve
-5. Already investigated 3x   → reject if fraud_score>=0.5 else approve
+1. fraud_score > 0.78        → reject    (clear fraud, never investigate)
+2. fraud_score < 0.22        → approve   (clear genuine, never investigate)
+3. budget < 0.5              → reject if fraud_score >= 0.45 else approve
+4. claims_remaining <= 2
+   AND budget < 1.5          → reject if fraud_score >= 0.50 else approve
+5. fraud_score 0.50–0.78     → request_info  (if budget_per_claim >= 0.5 and no prior request_info)
+                               document_audit (if request_info already done or unavailable)
+                               reject         (if neither fits budget)
+6. fraud_score 0.22–0.50     → request_info  (if budget_per_claim >= 0.5 and no prior request_info)
+                               quick_check    (if budget_per_claim >= 0.5 and request_info done)
+                               approve        (if neither fits)
+7. Already investigated 3x   → reject if fraud_score >= 0.50 else approve
+
+════════════════════════════════════════════════
+TOOL SELECTION RATIONALE
+════════════════════════════════════════════════
+• request_info (0.5 units, 100% accurate) is BEST first investigation.
+  Reveals three key fraud indicators directly. Use before paying for probabilistic checks.
+• document_audit (1.0 unit, 85%) for follow-up when request_info left ambiguity.
+• field_investigation (2.0 units, 95%) ONLY for high-value claims (amount > 0.7)
+  where document_audit result was inconclusive. Almost never justified in hard mode.
+• quick_check (0.5 units, 70%) as a budget-conscious check on mildly suspicious claims.
+
+════════════════════════════════════════════════
+HARD MODE WARNING — ADVERSARIAL FRAUD
+════════════════════════════════════════════════
+In hard mode (fraud_rate=65%), sophisticated fraudsters deliberately mimic
+genuine claimants: good documents, moderate amounts, quick filings.
+Fraud_score starts at 0.65 prior — most claims are fraudulent.
+Surface signals (document_score, days_since_incident) are unreliable.
+Rely on fraud_score updates from investigation over surface features.
+Budget is extremely scarce (2.5 units total). Do NOT field_investigate.
 
 ════════════════════════════════════════════════
 BUDGET DISCIPLINE
 ════════════════════════════════════════════════
-Your per-claim budget = investigation_units / claims_remaining.
-Never spend more than 1.5x that on a single claim.
-When claims_remaining <= 2, stop investigating — commit to decisions.
+budget_per_claim = investigation_units / claims_remaining
+Never exceed 1.5× budget_per_claim on a single claim.
+If budget_per_claim < 0.5, stop investigating and decide.
 
 ════════════════════════════════════════════════
 FEW-SHOT EXAMPLES
@@ -174,24 +168,32 @@ fraud_score=0.11, document_score=0.91, witness=True
 → approve   [rule 2: score < 0.22]
 
 # Example 2: obvious fraud
-fraud_score=0.85, days=47, prior_claims=6, document_score=0.12
+fraud_score=0.85, days=47, prior_claims=6
 → reject    [rule 1: score > 0.78]
 
-# Example 3: ambiguous, budget available
-fraud_score=0.58, document_score=0.55, units=2.0, remaining=4
-→ document_audit   [rule 3: ambiguous zone, 85% check worth 1 unit]
+# Example 3: ambiguous, investigate with request_info first
+fraud_score=0.58, units=2.0, remaining=4, no prior investigation
+→ request_info   [100% accurate, cheapest, reveals key fields]
 
-# Example 4: after document_audit updated score high
-fraud_score=0.83 (was 0.58 before audit)
-→ reject    [rule 1 now applies: score > 0.78]
+# Example 4: after request_info revealed high prior claims + long delay
+fraud_score=0.79 (was 0.58) after request_info
+→ reject    [rule 1 now applies]
 
-# Example 5: ambiguous, budget exhausted
-fraud_score=0.62, units=0.3, remaining=2
-→ reject    [rule 3: lean conservative when unsure + no budget]
+# Example 5: after request_info, still ambiguous
+fraud_score=0.63 (updated), units=1.5, remaining=3
+→ document_audit   [85% check to resolve remaining ambiguity]
 
-# Example 6: mildly suspicious, low budget, many claims left
-fraud_score=0.45, units=1.5, remaining=6, budget_per_claim=0.25
-→ approve   [rule 4: fraud_score < 0.50, budget_per_claim too low to investigate]
+# Example 6: budget exhausted, uncertain
+fraud_score=0.55, units=0.3, remaining=3
+→ reject    [rule 3: budget < 0.5, lean reject on fraud_score >= 0.45]
+
+# Example 7: hard mode, ambiguous but scarce budget
+fraud_score=0.62, units=0.5, remaining=2, budget_per_claim=0.25
+→ reject    [rule 4: end of episode + scarce budget + fraud_score >= 0.50]
+
+# Example 8: mildly suspicious, budget available
+fraud_score=0.38, units=1.5, remaining=5, budget_per_claim=0.30
+→ approve   [rule 6: fraud_score < 0.50, budget_per_claim too low to investigate]
 
 ════════════════════════════════════════════════
 OUTPUT FORMAT
@@ -200,13 +202,14 @@ One word only. No explanation, no punctuation.
 Valid: approve  reject  quick_check  document_audit  field_investigation  request_info"""
 
 
-def llm_agent(obs: Observation, client: OpenAI, claim_history: List[str], invest_count: int) -> str:
-    """Call the LLM, with guardrails applied first."""
+def llm_agent(obs: Observation, client: OpenAI, claim_history: List[str], invest_count: int, task: str) -> str:
+    """Call the LLM with task-adaptive guardrails applied first."""
 
-    # Guardrails run before the LLM is consulted
-    forced = apply_guardrails(obs, invest_count)
+    forced = apply_guardrails(obs, invest_count, task)
     if forced is not None:
         return forced
+
+    request_info_done = any("INFO" in h for h in claim_history)
 
     history_text = (
         "\n".join(f"  [{i+1}] {h}" for i, h in enumerate(claim_history[-3:]))
@@ -218,10 +221,15 @@ def llm_agent(obs: Observation, client: OpenAI, claim_history: List[str], invest
         if obs.claims_remaining > 0 else 0.0
     )
 
+    high = FRAUD_HIGH_THRESHOLD[task]
+    low  = FRAUD_LOW_THRESHOLD[task]
+
     user_prompt = f"""\
+Task: {task.upper()} mode
+
 Current claim
 ─────────────
-  fraud_score             : {obs.fraud_score:.3f}   ← primary signal
+  fraud_score             : {obs.fraud_score:.3f}   ← primary signal (thresholds: reject>{high}, approve<{low})
   claim_amount_normalized : {obs.claim_amount_normalized:.3f}
   days_since_incident     : {obs.days_since_incident}
   num_prior_claims        : {obs.num_prior_claims}
@@ -231,10 +239,11 @@ Current claim
 
 Budget
 ──────
-  investigation_units : {obs.investigation_units}
-  claims_remaining    : {obs.claims_remaining}
-  budget_per_claim    : {budget_per_claim}
-  investigations_used : {invest_count} / {MAX_INVEST_PER_CLAIM} max
+  investigation_units  : {obs.investigation_units}
+  claims_remaining     : {obs.claims_remaining}
+  budget_per_claim     : {budget_per_claim}
+  investigations_used  : {invest_count} / {MAX_INVEST_PER_CLAIM} max
+  request_info_done    : {request_info_done}
 
 Investigation results on this claim
 ────────────────────────────────────
@@ -266,10 +275,6 @@ Apply the DECISION TABLE, then reply with one word:"""
     return agent_policy(obs)
 
 
-# ---------------------------------------------------------------------------
-# Episode runner
-# ---------------------------------------------------------------------------
-
 def run_episode(task_name: str, use_llm: bool, client: Optional[OpenAI] = None) -> dict:
     env = InsuranceEnv(task=task_name)
     obs = env.reset()
@@ -285,7 +290,10 @@ def run_episode(task_name: str, use_llm: bool, client: Optional[OpenAI] = None) 
 
     try:
         while not done and steps < MAX_STEPS:
-            action = llm_agent(obs, client, claim_history, invest_count) if use_llm else agent_policy(obs)
+            if use_llm:
+                action = llm_agent(obs, client, claim_history, invest_count, task_name)
+            else:
+                action = agent_policy(obs)
 
             next_obs, reward_obj, done, info = env.step(Action(action=action))
             reward = reward_obj.value
@@ -296,6 +304,7 @@ def run_episode(task_name: str, use_llm: bool, client: Optional[OpenAI] = None) 
 
             explanation = info.get("explanation", "")
             if info.get("is_fraud") is not None:
+                
                 claim_history = []
                 invest_count = 0
             else:
@@ -331,10 +340,6 @@ def run_episode(task_name: str, use_llm: bool, client: Optional[OpenAI] = None) 
     }
 
 
-# ---------------------------------------------------------------------------
-# Results table
-# ---------------------------------------------------------------------------
-
 def print_comparison_table(baseline_results: List[dict], llm_results: List[dict]) -> None:
     W = 84
     print(f"\n{'═' * W}")
@@ -364,10 +369,6 @@ def print_comparison_table(baseline_results: List[dict], llm_results: List[dict]
         print(f"  {b['task']:<10} {b['score']:>10.3f} {l['score']:>10.3f} {delta:>+10.3f}   {result}")
     print()
 
-
-# ---------------------------------------------------------------------------
-# Entry point
-# ---------------------------------------------------------------------------
 
 def main() -> None:
     run_tasks = [os.getenv("TASK")] if os.getenv("TASK") else TASKS
