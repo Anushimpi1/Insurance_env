@@ -1,19 +1,3 @@
-"""
-Insurance Claim Adjudication under Uncertainty
-===============================================
-An OpenEnv environment where an AI agent acts as a senior insurance claim
-adjuster. The true fraud label is HIDDEN — the agent infers fraud likelihood
-from realistic, noisy signals and must allocate scarce investigation resources
-strategically across a caseload of 10 claims.
-
-Design goals
-------------
-* Partial observability  — no direct fraud label; agent reasons from signals
-* Resource management    — investigation budget shared across all claims
-* Asymmetric costs       — approving fraud is far worse than over-investigating
-* Difficulty progression — easy (clean signals) → hard (adversarial fraud)
-"""
-
 import random
 from typing import Optional
 from pydantic import BaseModel, Field
@@ -109,17 +93,6 @@ PENALTY_BUDGET_EXCEEDED  = -1.0
 
 
 class InsuranceEnv:
-    """
-    OpenEnv-compliant insurance claim adjudication environment.
-
-    Episode flow
-    ------------
-    reset() → returns Observation for claim #1
-    step(action) → (next_obs, Reward, done, info)
-        Terminal actions (approve/reject) advance to the next claim.
-        Investigation actions consume budget and return a noisy signal.
-    Episode ends when all TOTAL_CLAIMS have been resolved.
-    """
 
     def __init__(self, task: str = "easy", seed: int = 42):
         if task not in TASK_BUDGETS:
@@ -160,13 +133,7 @@ class InsuranceEnv:
         return self._make_observation()
 
     def step(self, action: Action):  
-        """
-        Process one action.
-
-        Returns
-        -------
-        (Observation, Reward, done: bool, info: dict)
-        """
+        
         action_str = action.action.strip().lower()
 
         if action_str not in VALID_ACTIONS:
@@ -220,14 +187,12 @@ class InsuranceEnv:
                     reward -= cost
 
                     if action_str == "request_info":
-                        
                         explanation = (
                             f"[INFO] prior_claims={claim.num_prior_claims}, "
                             f"days_since_incident={claim.days_since_incident}, "
                             f"repair_match={claim.repair_estimate_match:.2f} | "
                             f"Units left: {self.investigation_units}"
                         )
-                        
                         self._fraud_posterior = self._update_posterior_from_info(claim)
                     else:
                         accuracy = INVESTIGATION_ACCURACY[action_str]
@@ -236,7 +201,6 @@ class InsuranceEnv:
                             if self._rng.random() < accuracy
                             else not claim.is_fraud
                         )
-                       
                         self._fraud_posterior = self._bayesian_update(
                             self._fraud_posterior, accuracy, signal_is_fraud
                         )
@@ -258,7 +222,6 @@ class InsuranceEnv:
                         f"(costs {cost}, have {self.investigation_units:.1f})"
                     )
 
-        
         if not advance_claim and claim.claim_amount_normalized >= 0.75:
             reward += PENALTY_HIGH_VALUE_DELAY
             explanation += " | ⚠ High-value claim delay penalty"
@@ -271,7 +234,7 @@ class InsuranceEnv:
                 self.total_fraud += 1         
             self.current_claim_idx += 1
             self._steps_on_current_claim = 0
-            self._fraud_posterior = TASK_FRAUD_RATES[self.task]   
+            self._fraud_posterior = TASK_FRAUD_RATES[self.task]
             if self.current_claim_idx < self.total_claims:
                 self._current_claim = self._generate_claim()
 
@@ -316,11 +279,9 @@ class InsuranceEnv:
                                   / P(signal=fraud)
         """
         if signal_is_fraud:
-            
             numerator = accuracy * prior
             denominator = accuracy * prior + (1 - accuracy) * (1 - prior)
         else:
-           
             numerator = (1 - accuracy) * prior
             denominator = (1 - accuracy) * prior + accuracy * (1 - prior)
 
@@ -328,24 +289,51 @@ class InsuranceEnv:
             return prior
         return max(0.0, min(1.0, numerator / denominator))
 
-    @staticmethod
-    def _update_posterior_from_info(claim: _Claim) -> float:
-        """
-        Heuristic posterior update from exact claimant info (request_info action).
-        Stronger fraud signals push the posterior higher.
-        """
-        score = 0.0
-        score += 0.15 * min(claim.num_prior_claims / 5.0, 1.0)
-        score += 0.15 * min(claim.days_since_incident / 30.0, 1.0)
-        score += 0.20 * (1.0 - claim.repair_estimate_match)
-        return max(0.05, min(0.95, score + 0.3)) 
+    def _update_posterior_from_info(self, claim: _Claim) -> float:
+        
+        p = self._fraud_posterior  # start from current posterior, not scratch
+
+        if claim.num_prior_claims >= 5:
+            lr = 3.0   
+        elif claim.num_prior_claims >= 3:
+            lr = 1.8   
+        elif claim.num_prior_claims == 0:
+            lr = 0.5  
+        else:
+            lr = 1.0   # neutral
+        p = (lr * p) / (lr * p + (1 - p))
+        p = max(0.01, min(0.99, p))
+
+        if claim.days_since_incident > 40:
+            lr = 2.5
+        elif claim.days_since_incident > 20:
+            lr = 1.6
+        elif claim.days_since_incident <= 3:
+            lr = 0.6   
+        else:
+            lr = 1.0
+        p = (lr * p) / (lr * p + (1 - p))
+        p = max(0.01, min(0.99, p))
+
+
+        if claim.repair_estimate_match < 0.3:
+            lr = 2.8
+        elif claim.repair_estimate_match < 0.5:
+            lr = 1.5
+        elif claim.repair_estimate_match > 0.85:
+            lr = 0.5   
+        else:
+            lr = 1.0
+        p = (lr * p) / (lr * p + (1 - p))
+        p = max(0.05, min(0.95, p))
+
+        return p
 
     def _generate_claim(self) -> _Claim:
         rng = self._rng
         task = self.task
 
         if task == "easy":
-          
             is_fraud = rng.random() < TASK_FRAUD_RATES["easy"]
             if is_fraud:
                 return _Claim(
@@ -368,7 +356,6 @@ class InsuranceEnv:
             )
 
         elif task == "medium":
-            
             is_fraud = rng.random() < TASK_FRAUD_RATES["medium"]
             noise = rng.uniform(-0.2, 0.2)
             if is_fraud:
@@ -394,7 +381,7 @@ class InsuranceEnv:
         else:  
             is_fraud = rng.random() < TASK_FRAUD_RATES["hard"]
             if is_fraud:
-                
+              
                 return _Claim(
                     is_fraud=True,
                     claim_amount_normalized=rng.uniform(0.3, 0.75),
@@ -436,49 +423,47 @@ def grade_hard(env: InsuranceEnv) -> float:
     """Normalised total reward. Perfect play achieves ~65 reward → score 1.0."""
     return max(0.001, min(0.999, env.total_reward / 65.0))
 
+
 def agent_policy(obs: Observation) -> str:
-    """
-    Counts weighted fraud vs. genuine signals and decides:
-    - Obvious fraud (≥4 signals)  → reject immediately
-    - Obvious genuine (≥4 signals) → approve immediately
-    - Ambiguous → investigate (cheapest tool that fits budget)
-    - Budget exhausted → majority-vote on signals
-    """
+   
     units = obs.investigation_units
+    remaining = max(obs.claims_remaining, 1)
+    budget_per_claim = units / remaining
+    fs = obs.fraud_score
 
-    fraud_signals = sum([
-        obs.claim_amount_normalized > 0.75,
-        obs.days_since_incident > 30,
-        obs.num_prior_claims >= 4,
-        obs.document_score < 0.35,
-        not obs.witness_available,
-        obs.repair_estimate_match < 0.3,
-        obs.fraud_score > 0.7,          
-    ])
-
-    genuine_signals = sum([
-        obs.document_score > 0.8,
-        obs.witness_available,
-        obs.repair_estimate_match > 0.8,
-        obs.days_since_incident <= 3,
-        obs.num_prior_claims == 0,
-        obs.fraud_score < 0.3,
-    ])
-
-    if fraud_signals >= 4:
+    if fs >= 0.80:
         return "reject"
-    if genuine_signals >= 4:
+    if fs <= 0.20:
         return "approve"
 
     
-    if units >= 2.0:
-        return "field_investigation"
-    elif units >= 1.0:
-        return "document_audit"
-    elif units >= 0.5:
-        return "quick_check"
+    if units < 0.5:
+       
+        return "reject" if fs >= 0.45 else "approve"
 
-    return "reject" if fraud_signals >= genuine_signals else "approve"
+   
+    if fs >= 0.70:
+      
+        if units >= 1.0 and budget_per_claim >= 0.8:
+            return "document_audit"
+        return "reject"
+
+    if fs <= 0.30:
+        if units >= 0.5 and budget_per_claim >= 0.5:
+            return "quick_check"
+        return "approve"
+
+    
+    if units >= 0.5 and budget_per_claim >= 0.5:
+        return "request_info"
+
+    
+    if units >= 1.0 and budget_per_claim >= 1.0:
+        return "document_audit"
+
+    
+    return "reject" if fs >= 0.50 else "approve"
+
 
 if __name__ == "__main__":
 
