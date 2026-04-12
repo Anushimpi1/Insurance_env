@@ -7,11 +7,10 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 # Copy source
-COPY insurance.py inference.py server.py openenv.yaml ./
+COPY insurance.py inference.py server.py app.py openenv.yaml README.md ./
 
 # Expose FastAPI port
-EXPOSE 8000
+EXPOSE 7860
 
-# Default: run the FastAPI server
-# Override CMD to run inference: docker run ... python inference.py
-CMD ["uvicorn", "server:app", "--host", "0.0.0.0", "--port", "7860"]
+# Run server via main() entry point
+CMD ["python", "server.py"]
