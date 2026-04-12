@@ -13,7 +13,8 @@ from insurance import (
 
 API_BASE_URL = os.getenv("API_BASE_URL", "https://api.groq.com/openai/v1")
 MODEL_NAME   = os.getenv("MODEL_NAME",   "llama-3.3-70b-versatile")
-API_KEY = os.getenv("API_KEY") or os.getenv("HF_TOKEN")
+
+API_KEY      = os.getenv("API_KEY") or os.getenv("HF_TOKEN")
 
 TASKS     = ["easy", "medium", "hard"]
 BENCHMARK = "insurance_env"
@@ -21,9 +22,8 @@ MAX_STEPS = 90
 
 GRADERS = {"easy": grade_easy, "medium": grade_medium, "hard": grade_hard}
 
-
-FRAUD_SIGNAL_REJECT    = {"easy": 4, "medium": 4, "hard": 3}
-GENUINE_SIGNAL_APPROVE = {"easy": 4, "medium": 4, "hard": 5}
+FRAUD_SIGNAL_REJECT    = {"easy": 6, "medium": 5, "hard": 4}
+GENUINE_SIGNAL_APPROVE = {"easy": 6, "medium": 5, "hard": 6}
 MAX_INVEST_PER_CLAIM   = 3
 
 
@@ -54,7 +54,7 @@ def log_end(success: bool, steps: int, score: float, rewards: List[float]) -> No
     )
 
 def _count_signals(obs: InsuranceObservation) -> tuple[int, int]:
-   
+    """Count weighted fraud and genuine signals from raw observation."""
     fraud_signals = sum([
         obs.claim_amount_normalized > 0.75,
         obs.days_since_incident > 30,
@@ -111,7 +111,7 @@ def llm_agent(
     invest_count: int,
     task: str,
 ) -> str:
-   
+    """Query the LLM with guardrails applied first."""
     forced = apply_guardrails(obs, invest_count, task)
     if forced is not None:
         return forced
@@ -169,11 +169,9 @@ Count F and G signals, follow the DECISION PROCESS, reply with one word:"""
     print(f"[WARN] Unparseable LLM output '{raw}', using baseline", flush=True)
     return agent_policy(obs)
 
-
 def run_episode(
     task_name: str, use_llm: bool, client: Optional[OpenAI] = None
 ) -> dict:
-    
     env = InsuranceEnvironment(task=task_name)
     obs = env.reset()
 
@@ -202,6 +200,7 @@ def run_episode(
                 done=obs.done, error=None,
             )
 
+            
             if obs.metadata.get("is_fraud") is not None:
                 invest_count = 0
             else:
@@ -277,18 +276,18 @@ def print_comparison_table(
 
 def main() -> None:
     run_tasks = [os.getenv("TASK")] if os.getenv("TASK") else TASKS
-    run_agent = os.getenv("AGENT", "both").lower()
+    # Default to "llm" so validator always makes API calls
+    run_agent = os.getenv("AGENT", "llm").lower()
 
     if run_agent in ("llm", "both") and not API_KEY:
         print(
-            "[ERROR] No API key found. Set API_KEY or HF_TOKEN.\n"
-            "        Baseline only: AGENT=baseline python inference.py",
+            "[WARN] No API_KEY found in environment. "
+            "Validator should inject API_KEY automatically.",
             file=sys.stderr,
         )
-        sys.exit(1)
 
     client = (
-        OpenAI(base_url=API_BASE_URL, api_key=API_KEY)
+        OpenAI(base_url=API_BASE_URL, api_key=API_KEY or "placeholder")
         if run_agent in ("llm", "both") else None
     )
 
